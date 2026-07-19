@@ -709,6 +709,25 @@ static int conn_call_recv_datagram(ngtcp2_conn *conn,
   return 0;
 }
 
+static int conn_call_recv_mc_flow(ngtcp2_conn *conn,
+                                  const ngtcp2_mc_flow *fr) {
+  int rv;
+
+  if (!conn->callbacks.recv_mc_flow) {
+    return 0;
+  }
+
+  rv = conn->callbacks.recv_mc_flow(
+    conn, fr->flow_id, fr->flow_idlen, fr->ip_version, fr->src_ip,
+    fr->group_ip, fr->udp_port, fr->cipher_suite, fr->first_pkt_num,
+    fr->secret, fr->secretlen, conn->user_data);
+  if (rv != 0) {
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+
+  return 0;
+}
+
 static int
 conn_call_update_key(ngtcp2_conn *conn, uint8_t *rx_secret, uint8_t *tx_secret,
                      ngtcp2_crypto_aead_ctx *rx_aead_ctx, uint8_t *rx_iv,
@@ -8702,6 +8721,19 @@ static int conn_recv_datagram(ngtcp2_conn *conn, ngtcp2_datagram *fr) {
 }
 
 /*
+ * conn_recv_mc_flow processes the incoming MC_FLOW frame |fr|.
+ *
+ * This function returns 0 if it succeeds, or one of the following
+ * negative error codes:
+ *
+ * NGTCP2_ERR_CALLBACK_FAILURE
+ *     User-defined callback function failed.
+ */
+static int conn_recv_mc_flow(ngtcp2_conn *conn, const ngtcp2_mc_flow *fr) {
+  return conn_call_recv_mc_flow(conn, fr);
+}
+
+/*
  * conn_key_phase_changed returns nonzero if |hd| indicates that the
  * key phase has unexpected value.
  */
@@ -9764,6 +9796,13 @@ static ngtcp2_ssize conn_recv_pkt(ngtcp2_conn *conn, const ngtcp2_path *path,
         return NGTCP2_ERR_PROTO;
       }
       rv = conn_recv_datagram(conn, &fr.datagram);
+      if (rv != 0) {
+        return rv;
+      }
+      non_probing_pkt = 1;
+      break;
+    case NGTCP2_FRAME_MC_FLOW:
+      rv = conn_recv_mc_flow(conn, &fr.mc_flow);
       if (rv != 0) {
         return rv;
       }

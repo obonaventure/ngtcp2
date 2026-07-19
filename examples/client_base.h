@@ -100,6 +100,10 @@ struct Config {
   // no_preferred_addr is true if client do not follow preferred
   // address offered by server.
   bool no_preferred_addr{};
+  // mc_quic is true if client sends "mc-quic" ALPN token for the
+  // experimental multicast QUIC extension instead of the usual h3 or
+  // hq-interop token.
+  bool mc_quic{};
   std::string_view http_method{"GET"sv};
   // download is a path to a directory where a downloaded file is
   // saved.  If it is empty, no file is saved.

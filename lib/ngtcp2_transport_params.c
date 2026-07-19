@@ -233,6 +233,9 @@ ngtcp2_ssize ngtcp2_transport_params_encode_versioned(
   if (params->grease_quic_bit) {
     len += zero_paramlen(NGTCP2_TRANSPORT_PARAM_GREASE_QUIC_BIT);
   }
+  if (params->multicast_support) {
+    len += zero_paramlen(NGTCP2_TRANSPORT_PARAM_MULTICAST_SUPPORT);
+  }
   if (params->version_info_present) {
     version_infolen =
       sizeof(uint32_t) + params->version_info.available_versionslen;
@@ -376,6 +379,10 @@ ngtcp2_ssize ngtcp2_transport_params_encode_versioned(
 
   if (params->grease_quic_bit) {
     p = write_zero_param(p, NGTCP2_TRANSPORT_PARAM_GREASE_QUIC_BIT);
+  }
+
+  if (params->multicast_support) {
+    p = write_zero_param(p, NGTCP2_TRANSPORT_PARAM_MULTICAST_SUPPORT);
   }
 
   if (params->version_info_present) {
@@ -728,6 +735,12 @@ int ngtcp2_transport_params_decode_versioned(int transport_params_version,
         return NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM;
       }
       params->grease_quic_bit = 1;
+      break;
+    case NGTCP2_TRANSPORT_PARAM_MULTICAST_SUPPORT:
+      if (decode_zero_param(&p, end) != 0) {
+        return NGTCP2_ERR_MALFORMED_TRANSPORT_PARAM;
+      }
+      params->multicast_support = 1;
       break;
     case NGTCP2_TRANSPORT_PARAM_VERSION_INFORMATION:
       if (decode_varint(&valuelen, &p, end) != 0) {

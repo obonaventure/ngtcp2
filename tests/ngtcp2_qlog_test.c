@@ -698,7 +698,8 @@ void test_ngtcp2_qlog_parameters_set_transport_params(void) {
     "\"stateless_reset_token\":{\"data\":\"ddc1b991dab60067e59149ef0e2f5323\"}}"
     ","
     "\"max_datagram_frame_size\":4611686018427387903,"
-    "\"grease_quic_bit\":true}}\n",
+    "\"grease_quic_bit\":true,"
+    "\"multicast_support\":false}}\n",
     (const char *)buf);
 }
 

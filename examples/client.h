@@ -83,6 +83,27 @@ struct Endpoint {
   int fd{};
 };
 
+// McFlowState holds the state of an experimental multicast flow
+// announced via an MC_FLOW frame.  See
+// https://github.com/louisna/minimal-multicast-quic-ietf-126.
+struct McFlowState {
+  bool active = false;
+  std::vector<uint8_t> flow_id;
+  uint8_t ip_version = 0;
+  std::array<uint8_t, 16> src_ip{};
+  std::array<uint8_t, 16> group_ip{};
+  uint16_t udp_port = 0;
+  uint16_t cipher_suite = 0;
+  uint64_t first_pkt_num = 0;
+  std::vector<uint8_t> secret;
+  // key, iv, and hp_key are derived from secret using the RFC 9001
+  // key derivation procedure.  Only TLS_AES_128_GCM_SHA256 (0x1301)
+  // is currently supported.
+  std::array<uint8_t, 16> key{};
+  std::array<uint8_t, 12> iv{};
+  std::array<uint8_t, 16> hp_key{};
+};
+
 class Client : public ClientBase {
 public:
   Client(struct ev_loop *loop, uint32_t client_chosen_version,
@@ -141,6 +162,15 @@ public:
 
   std::expected<Endpoint *, Error> endpoint_for(const Address &remote_addr);
 
+  int on_recv_mc_flow(const uint8_t *flow_id, size_t flow_idlen,
+                      uint8_t ip_version, const uint8_t *src_ip,
+                      const uint8_t *group_ip, uint16_t udp_port,
+                      uint16_t cipher_suite, uint64_t first_pkt_num,
+                      const uint8_t *secret, size_t secretlen);
+  void on_mc_read(const Endpoint &ep);
+  void process_mc_packet(std::span<const uint8_t> pkt);
+  void extract_mc_datagrams(std::span<const uint8_t> data);
+
   void set_remote_addr(const ngtcp2_addr &remote_addr);
 
   std::expected<void, Error> setup_codec();
@@ -171,6 +201,7 @@ public:
 
 private:
   std::vector<Endpoint> endpoints_;
+  McFlowState mc_flow_;
   Address remote_addr_;
   ev_io wev_;
   ev_timer timer_;

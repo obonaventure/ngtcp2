@@ -63,6 +63,7 @@ static const MunitTest tests[] = {
   munit_void_test(test_ngtcp2_pkt_encode_retire_connection_id_frame),
   munit_void_test(test_ngtcp2_pkt_encode_handshake_done_frame),
   munit_void_test(test_ngtcp2_pkt_encode_datagram_frame),
+  munit_void_test(test_ngtcp2_pkt_decode_mc_flow_frame),
   munit_void_test(test_ngtcp2_pkt_adjust_pkt_num),
   munit_void_test(test_ngtcp2_pkt_validate_ack),
   munit_void_test(test_ngtcp2_pkt_write_stateless_reset),
@@ -1845,6 +1846,135 @@ void test_ngtcp2_pkt_encode_datagram_frame(void) {
   assert_ptrdiff((ngtcp2_ssize)framelen, ==, rv);
   assert_uint64(fr.type, ==, nfr.type);
   assert_size(fr.datacnt, ==, nfr.datacnt);
+}
+
+void test_ngtcp2_pkt_decode_mc_flow_frame(void) {
+  static const uint8_t flow_id[] = {0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08};
+  static const uint8_t secret[32] = {
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+  };
+  static const uint8_t src_ip4[] = {10, 0, 0, 1};
+  static const uint8_t group_ip4[] = {232, 1, 1, 1};
+  static const uint8_t src_ip6[] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0,
+                                    0,    0,    0,    0,    0, 0, 0, 1};
+  static const uint8_t group_ip6[] = {0xff, 0x3e, 0, 0, 0, 0, 0, 0,
+                                      0,    0,    0, 0, 0, 0, 0, 1};
+  uint8_t buf[256];
+  uint8_t *p;
+  ngtcp2_mc_flow fr;
+  ngtcp2_ssize rv;
+  size_t framelen;
+  size_t i;
+
+  /* IPv4 */
+  p = buf;
+  *p++ = 0x80;
+  *p++ = 0xff;
+  *p++ = 0x4d;
+  *p++ = 0x43;
+  *p++ = (uint8_t)sizeof(flow_id);
+  p = ngtcp2_cpymem(p, flow_id, sizeof(flow_id));
+  *p++ = 4;
+  p = ngtcp2_cpymem(p, src_ip4, sizeof(src_ip4));
+  p = ngtcp2_cpymem(p, group_ip4, sizeof(group_ip4));
+  *p++ = 0x13;
+  *p++ = 0x88;
+  *p++ = 0x13;
+  *p++ = 0x01;
+  *p++ = 0x00;
+  *p++ = (uint8_t)sizeof(secret);
+  p = ngtcp2_cpymem(p, secret, sizeof(secret));
+
+  framelen = (size_t)(p - buf);
+
+  rv = ngtcp2_pkt_decode_mc_flow_frame(&fr, buf, framelen);
+
+  assert_ptrdiff((ngtcp2_ssize)framelen, ==, rv);
+  assert_uint64(NGTCP2_FRAME_MC_FLOW, ==, fr.type);
+  assert_size(sizeof(flow_id), ==, fr.flow_idlen);
+  assert_memory_equal(sizeof(flow_id), flow_id, fr.flow_id);
+  assert_uint8(4, ==, fr.ip_version);
+  assert_memory_equal(sizeof(src_ip4), src_ip4, fr.src_ip);
+  assert_memory_equal(sizeof(group_ip4), group_ip4, fr.group_ip);
+  assert_uint16(5000, ==, fr.udp_port);
+  assert_uint16(0x1301, ==, fr.cipher_suite);
+  assert_uint64(0, ==, fr.first_pkt_num);
+  assert_size(sizeof(secret), ==, fr.secretlen);
+  assert_memory_equal(sizeof(secret), secret, fr.secret);
+
+  /* Fail if a frame is truncated. */
+  for (i = 1; i < framelen; ++i) {
+    rv = ngtcp2_pkt_decode_mc_flow_frame(&fr, buf, i);
+
+    assert_ptrdiff(NGTCP2_ERR_FRAME_ENCODING, ==, rv);
+  }
+
+  /* IPv6 */
+  p = buf;
+  *p++ = 0x80;
+  *p++ = 0xff;
+  *p++ = 0x4d;
+  *p++ = 0x43;
+  *p++ = (uint8_t)sizeof(flow_id);
+  p = ngtcp2_cpymem(p, flow_id, sizeof(flow_id));
+  *p++ = 6;
+  p = ngtcp2_cpymem(p, src_ip6, sizeof(src_ip6));
+  p = ngtcp2_cpymem(p, group_ip6, sizeof(group_ip6));
+  *p++ = 0x13;
+  *p++ = 0x88;
+  *p++ = 0x13;
+  *p++ = 0x01;
+  *p++ = 0x00;
+  *p++ = (uint8_t)sizeof(secret);
+  p = ngtcp2_cpymem(p, secret, sizeof(secret));
+
+  framelen = (size_t)(p - buf);
+
+  rv = ngtcp2_pkt_decode_mc_flow_frame(&fr, buf, framelen);
+
+  assert_ptrdiff((ngtcp2_ssize)framelen, ==, rv);
+  assert_uint8(6, ==, fr.ip_version);
+  assert_memory_equal(sizeof(src_ip6), src_ip6, fr.src_ip);
+  assert_memory_equal(sizeof(group_ip6), group_ip6, fr.group_ip);
+
+  /* Fail if a frame is truncated. */
+  for (i = 1; i < framelen; ++i) {
+    rv = ngtcp2_pkt_decode_mc_flow_frame(&fr, buf, i);
+
+    assert_ptrdiff(NGTCP2_ERR_FRAME_ENCODING, ==, rv);
+  }
+
+  /* Invalid IP Version */
+  p = buf;
+  *p++ = 0x80;
+  *p++ = 0xff;
+  *p++ = 0x4d;
+  *p++ = 0x43;
+  *p++ = (uint8_t)sizeof(flow_id);
+  p = ngtcp2_cpymem(p, flow_id, sizeof(flow_id));
+  *p++ = 5;
+
+  framelen = (size_t)(p - buf);
+
+  rv = ngtcp2_pkt_decode_mc_flow_frame(&fr, buf, framelen);
+
+  assert_ptrdiff(NGTCP2_ERR_FRAME_ENCODING, ==, rv);
+
+  /* Invalid Flow ID Length (0) */
+  p = buf;
+  *p++ = 0x80;
+  *p++ = 0xff;
+  *p++ = 0x4d;
+  *p++ = 0x43;
+  *p++ = 0;
+
+  framelen = (size_t)(p - buf);
+
+  rv = ngtcp2_pkt_decode_mc_flow_frame(&fr, buf, framelen);
+
+  assert_ptrdiff(NGTCP2_ERR_FRAME_ENCODING, ==, rv);
 }
 
 void test_ngtcp2_pkt_adjust_pkt_num(void) {

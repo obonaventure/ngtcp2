@@ -43,6 +43,9 @@
 #include <libgen.h>
 #include <netinet/udp.h>
 
+#include <openssl/evp.h>
+#include <openssl/hmac.h>
+
 #include <urlparse.h>
 
 #include "client.h"
@@ -618,6 +621,28 @@ int recv_rx_key(ngtcp2_conn *conn, ngtcp2_encryption_level level,
 } // namespace
 
 namespace {
+int recv_mc_flow(ngtcp2_conn *conn, const uint8_t *flow_id, size_t flow_idlen,
+                 uint8_t ip_version, const uint8_t *src_ip,
+                 const uint8_t *group_ip, uint16_t udp_port,
+                 uint16_t cipher_suite, uint64_t first_pkt_num,
+                 const uint8_t *secret, size_t secretlen, void *user_data) {
+  auto c = static_cast<Client *>(user_data);
+
+  return c->on_recv_mc_flow(flow_id, flow_idlen, ip_version, src_ip, group_ip,
+                            udp_port, cipher_suite, first_pkt_num, secret,
+                            secretlen);
+}
+} // namespace
+
+namespace {
+void mc_readcb(struct ev_loop *loop, ev_io *w, int revents) {
+  auto ep = static_cast<Endpoint *>(w->data);
+
+  ep->client->on_mc_read(*ep);
+}
+} // namespace
+
+namespace {
 int early_data_rejected(ngtcp2_conn *conn, void *user_data) {
   auto c = static_cast<Client *>(user_data);
 
@@ -674,6 +699,7 @@ std::expected<void, Error> Client::init(int fd, const Address &local_addr,
     .recv_new_token = ::recv_new_token,
     .delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb,
     .delete_crypto_cipher_ctx = ngtcp2_crypto_delete_crypto_cipher_ctx_cb,
+    .recv_mc_flow = ::recv_mc_flow,
     .stream_stop_sending = stream_stop_sending,
     .version_negotiation = ngtcp2_crypto_version_negotiation_cb,
     .recv_rx_key = ::recv_rx_key,
@@ -792,6 +818,7 @@ std::expected<void, Error> Client::init(int fd, const Address &local_addr,
   params.max_idle_timeout = config.timeout;
   params.active_connection_id_limit = 7;
   params.grease_quic_bit = 1;
+  params.multicast_support = 1;
 
   auto path = ngtcp2_path{
     .local = as_ngtcp2_addr(ep.addr),
@@ -1204,6 +1231,298 @@ std::expected<int, Error> udp_sock(int family) {
 } // namespace
 
 namespace {
+// build_hkdf_label builds the HkdfLabel structure from RFC 8446
+// section 7.1 for the given |length| and |label|, with an empty
+// Context field, as used by RFC 9001's HKDF-Expand-Label.
+std::vector<uint8_t> build_hkdf_label(size_t length, std::string_view label) {
+  std::vector<uint8_t> info;
+  auto full_label = "tls13 "s;
+  full_label += label;
+
+  info.push_back(static_cast<uint8_t>(length >> 8));
+  info.push_back(static_cast<uint8_t>(length));
+  info.push_back(static_cast<uint8_t>(full_label.size()));
+  info.insert(info.end(), full_label.begin(), full_label.end());
+  info.push_back(0);
+
+  return info;
+}
+
+bool hkdf_expand(std::span<uint8_t> dest, std::span<const uint8_t> secret,
+                 std::span<const uint8_t> info) {
+  std::array<uint8_t, EVP_MAX_MD_SIZE> t{};
+  unsigned int tlen = 0;
+  size_t offset = 0;
+  uint8_t counter = 0;
+  std::vector<uint8_t> hmac_input;
+
+  while (offset < dest.size()) {
+    ++counter;
+
+    hmac_input.assign(t.begin(), t.begin() + tlen);
+    hmac_input.insert(hmac_input.end(), info.begin(), info.end());
+    hmac_input.push_back(counter);
+
+    if (!HMAC(EVP_sha256(), secret.data(), static_cast<int>(secret.size()),
+              hmac_input.data(), hmac_input.size(), t.data(), &tlen)) {
+      return false;
+    }
+
+    auto n = std::min(dest.size() - offset, static_cast<size_t>(tlen));
+    std::copy_n(t.begin(), n, dest.begin() + offset);
+    offset += n;
+  }
+
+  return true;
+}
+
+// hkdf_expand_label implements RFC 8446 section 7.1
+// HKDF-Expand-Label using HMAC-SHA256, for the RFC 9001 multicast
+// flow key derivation ("quic key"/"quic iv"/"quic hp" over the
+// MC_FLOW Secret).  Only TLS_AES_128_GCM_SHA256 is supported, hence
+// SHA256 is hard-coded.
+bool hkdf_expand_label(std::span<uint8_t> dest, std::span<const uint8_t> secret,
+                       std::string_view label) {
+  auto info = build_hkdf_label(dest.size(), label);
+
+  return hkdf_expand(dest, secret, info);
+}
+
+// aes128gcm_decrypt decrypts |ciphertext_and_tag| (ciphertext
+// followed by a 16 byte authentication tag) with AES-128-GCM using
+// |key| and |nonce|, authenticating |aad|, and writes the plaintext
+// to |plaintext|.  |plaintext| must have enough capacity to hold
+// ciphertext_and_tag.size() - 16 bytes.
+bool aes128gcm_decrypt(std::span<uint8_t> plaintext,
+                       std::span<const uint8_t> ciphertext_and_tag,
+                       std::span<const uint8_t> key,
+                       std::span<const uint8_t> nonce,
+                       std::span<const uint8_t> aad) {
+  constexpr size_t kTagLen = 16;
+
+  if (ciphertext_and_tag.size() < kTagLen) {
+    return false;
+  }
+
+  auto ciphertext = ciphertext_and_tag.first(ciphertext_and_tag.size() - kTagLen);
+  auto tag = ciphertext_and_tag.last(kTagLen);
+
+  auto ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) {
+    return false;
+  }
+
+  auto ctx_d = defer([ctx] { EVP_CIPHER_CTX_free(ctx); });
+
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_128_gcm(), nullptr, nullptr, nullptr) !=
+        1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN,
+                          static_cast<int>(nonce.size()), nullptr) != 1 ||
+      EVP_DecryptInit_ex(ctx, nullptr, nullptr, key.data(), nonce.data()) !=
+        1) {
+    return false;
+  }
+
+  int len;
+
+  if (!aad.empty() && EVP_DecryptUpdate(ctx, nullptr, &len, aad.data(),
+                                        static_cast<int>(aad.size())) != 1) {
+    return false;
+  }
+
+  if (EVP_DecryptUpdate(ctx, plaintext.data(), &len, ciphertext.data(),
+                        static_cast<int>(ciphertext.size())) != 1) {
+    return false;
+  }
+
+  auto outlen = len;
+
+  if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_TAG,
+                          static_cast<int>(tag.size()),
+                          const_cast<uint8_t *>(tag.data())) != 1 ||
+      EVP_DecryptFinal_ex(ctx, plaintext.data() + outlen, &len) != 1) {
+    return false;
+  }
+
+  return true;
+}
+
+// aes128_ecb_mask computes the RFC 9001 section 5.4.3 header
+// protection mask for AES-based cipher suites: a single AES-128-ECB
+// block encryption of |sample| under |hp_key|.
+bool aes128_ecb_mask(std::span<uint8_t> mask, std::span<const uint8_t> hp_key,
+                     std::span<const uint8_t> sample) {
+  auto ctx = EVP_CIPHER_CTX_new();
+  if (!ctx) {
+    return false;
+  }
+
+  auto ctx_d = defer([ctx] { EVP_CIPHER_CTX_free(ctx); });
+
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_128_ecb(), nullptr, hp_key.data(),
+                         nullptr) != 1) {
+    return false;
+  }
+
+  EVP_CIPHER_CTX_set_padding(ctx, 0);
+
+  std::array<uint8_t, EVP_MAX_BLOCK_LENGTH * 2> out;
+  int len;
+
+  if (EVP_EncryptUpdate(ctx, out.data(), &len, sample.data(),
+                        static_cast<int>(sample.size())) != 1) {
+    return false;
+  }
+
+  std::copy_n(out.begin(), mask.size(), mask.begin());
+
+  return true;
+}
+
+// create_mc_sock creates a UDP socket bound to |port|, joins the
+// source-specific multicast group (|src_ip|, |group_ip|) (|ip_version|
+// is 4 or 6, and src_ip/group_ip contain the address in network byte
+// order, 4 or 16 bytes long accordingly), and returns the socket in
+// non-blocking mode.  |local_addr| is the local address used for the
+// unicast QUIC connection; the multicast group join is bound to the
+// same interface, since on multi-homed hosts an unqualified
+// INADDR_ANY/interface-index-0 join can silently attach to the wrong
+// interface and never see any traffic.
+std::expected<int, Error> create_mc_sock(uint8_t ip_version,
+                                         const uint8_t *src_ip,
+                                         const uint8_t *group_ip,
+                                         uint16_t port,
+                                         const Address &local_addr) {
+  auto family = ip_version == 4 ? AF_INET : AF_INET6;
+
+  auto fd = socket(family, SOCK_DGRAM, 0);
+  if (fd == -1) {
+    std::println(stderr, "mc socket: {}", strerror(errno));
+    return std::unexpected{Error::SYSCALL};
+  }
+
+  auto fd_d = defer([&fd] {
+    if (fd != -1) {
+      close(fd);
+    }
+  });
+
+  int reuse = 1;
+  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+#ifdef SO_REUSEPORT
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &reuse, sizeof(reuse));
+#endif // defined(SO_REUSEPORT)
+
+  if (family == AF_INET) {
+    sockaddr_in sa{};
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(port);
+    sa.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) == -1) {
+      std::println(stderr, "mc bind: {}", strerror(errno));
+      return std::unexpected{Error::SYSCALL};
+    }
+
+    in_addr interface{};
+
+    if (local_addr.family() == AF_INET) {
+      auto local_sin =
+        reinterpret_cast<const sockaddr_in *>(local_addr.as_sockaddr());
+      interface = local_sin->sin_addr;
+    } else {
+      interface.s_addr = htonl(INADDR_ANY);
+    }
+
+    static constexpr uint8_t kUnspecifiedIP4[4]{};
+
+    if (std::memcmp(src_ip, kUnspecifiedIP4, 4) == 0) {
+      // Source IP is unspecified (0.0.0.0): the server is announcing
+      // an any-source multicast (ASM) group rather than SSM, so join
+      // without a source filter.  A source-specific join here would
+      // filter on source 0.0.0.0, which no real sender ever has, and
+      // every packet would be silently dropped.
+      ip_mreq mreq{};
+      std::memcpy(&mreq.imr_multiaddr, group_ip, 4);
+      mreq.imr_interface = interface;
+
+      if (setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq,
+                     sizeof(mreq)) == -1) {
+        std::println(stderr, "IP_ADD_MEMBERSHIP: {}", strerror(errno));
+        return std::unexpected{Error::SYSCALL};
+      }
+    } else {
+      ip_mreq_source mreqs{};
+      std::memcpy(&mreqs.imr_multiaddr, group_ip, 4);
+      std::memcpy(&mreqs.imr_sourceaddr, src_ip, 4);
+      mreqs.imr_interface = interface;
+
+      if (setsockopt(fd, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, &mreqs,
+                     sizeof(mreqs)) == -1) {
+        std::println(stderr, "IP_ADD_SOURCE_MEMBERSHIP: {}", strerror(errno));
+        return std::unexpected{Error::SYSCALL};
+      }
+    }
+  } else {
+    sockaddr_in6 sa{};
+    sa.sin6_family = AF_INET6;
+    sa.sin6_port = htons(port);
+    sa.sin6_addr = in6addr_any;
+
+    if (bind(fd, reinterpret_cast<sockaddr *>(&sa), sizeof(sa)) == -1) {
+      std::println(stderr, "mc bind: {}", strerror(errno));
+      return std::unexpected{Error::SYSCALL};
+    }
+
+    static constexpr uint8_t kUnspecifiedIP6[16]{};
+
+    if (std::memcmp(src_ip, kUnspecifiedIP6, 16) == 0) {
+      // See the IPv4 branch above: an unspecified source means ASM,
+      // not SSM.
+      group_req gr{};
+      gr.gr_interface = 0;
+
+      auto gaddr = reinterpret_cast<sockaddr_in6 *>(&gr.gr_group);
+      gaddr->sin6_family = AF_INET6;
+      std::memcpy(&gaddr->sin6_addr, group_ip, 16);
+
+      if (setsockopt(fd, IPPROTO_IPV6, MCAST_JOIN_GROUP, &gr, sizeof(gr)) ==
+          -1) {
+        std::println(stderr, "MCAST_JOIN_GROUP: {}", strerror(errno));
+        return std::unexpected{Error::SYSCALL};
+      }
+    } else {
+      group_source_req gsr{};
+      gsr.gsr_interface = 0;
+
+      auto gaddr = reinterpret_cast<sockaddr_in6 *>(&gsr.gsr_group);
+      gaddr->sin6_family = AF_INET6;
+      std::memcpy(&gaddr->sin6_addr, group_ip, 16);
+
+      auto saddr = reinterpret_cast<sockaddr_in6 *>(&gsr.gsr_source);
+      saddr->sin6_family = AF_INET6;
+      std::memcpy(&saddr->sin6_addr, src_ip, 16);
+
+      if (setsockopt(fd, IPPROTO_IPV6, MCAST_JOIN_SOURCE_GROUP, &gsr,
+                     sizeof(gsr)) == -1) {
+        std::println(stderr, "MCAST_JOIN_SOURCE_GROUP: {}", strerror(errno));
+        return std::unexpected{Error::SYSCALL};
+      }
+    }
+  }
+
+  if (auto rv = util::make_socket_nonblocking(fd); !rv) {
+    return std::unexpected{rv.error()};
+  }
+
+  auto res = fd;
+  fd = -1;
+
+  return res;
+}
+} // namespace
+
+namespace {
 std::expected<int, Error> create_sock(Address &remote_addr, const char *addr,
                                       const char *port) {
   addrinfo hints{
@@ -1242,6 +1561,251 @@ std::expected<int, Error> create_sock(Address &remote_addr, const char *addr,
   return fd;
 }
 } // namespace
+
+int Client::on_recv_mc_flow(const uint8_t *flow_id, size_t flow_idlen,
+                            uint8_t ip_version, const uint8_t *src_ip,
+                            const uint8_t *group_ip, uint16_t udp_port,
+                            uint16_t cipher_suite, uint64_t first_pkt_num,
+                            const uint8_t *secret, size_t secretlen) {
+  if (mc_flow_.active) {
+    // This PoC only supports a single multicast flow per connection.
+    return 0;
+  }
+
+  if (cipher_suite != 0x1301) {
+    std::println(stderr, "mc_flow: unsupported cipher_suite={:#x}",
+                 cipher_suite);
+    return 0;
+  }
+
+  mc_flow_.flow_id.assign(flow_id, flow_id + flow_idlen);
+  mc_flow_.ip_version = ip_version;
+  std::memcpy(mc_flow_.src_ip.data(), src_ip, ip_version == 4 ? 4 : 16);
+  std::memcpy(mc_flow_.group_ip.data(), group_ip, ip_version == 4 ? 4 : 16);
+  mc_flow_.udp_port = udp_port;
+  mc_flow_.cipher_suite = cipher_suite;
+  mc_flow_.first_pkt_num = first_pkt_num;
+  mc_flow_.secret.assign(secret, secret + secretlen);
+
+  if (!hkdf_expand_label(mc_flow_.key, mc_flow_.secret, "quic key"sv) ||
+      !hkdf_expand_label(mc_flow_.iv, mc_flow_.secret, "quic iv"sv) ||
+      !hkdf_expand_label(mc_flow_.hp_key, mc_flow_.secret, "quic hp"sv)) {
+    std::println(stderr, "mc_flow: key derivation failed");
+    return 0;
+  }
+
+  auto current_path = ngtcp2_conn_get_path2(conn_);
+  auto current_ep = static_cast<Endpoint *>(current_path->user_data);
+
+  auto maybe_fd =
+    create_mc_sock(ip_version, src_ip, group_ip, udp_port, current_ep->addr);
+  if (!maybe_fd) {
+    std::println(stderr, "mc_flow: could not join multicast group");
+    return 0;
+  }
+
+  endpoints_.emplace_back();
+  auto &ep = endpoints_.back();
+  ep.client = this;
+  ep.fd = *maybe_fd;
+  ev_io_init(&ep.rev, mc_readcb, ep.fd, EV_READ);
+  ep.rev.data = &ep;
+  ev_io_start(loop_, &ep.rev);
+
+  mc_flow_.active = true;
+
+  if (!config.quiet) {
+    std::array<char, INET6_ADDRSTRLEN> srcbuf, groupbuf;
+    auto family = ip_version == 4 ? AF_INET : AF_INET6;
+    auto src_str = inet_ntop(family, src_ip, srcbuf.data(), srcbuf.size());
+    auto group_str =
+      inet_ntop(family, group_ip, groupbuf.data(), groupbuf.size());
+
+    std::println(
+      stderr,
+      "Joined multicast flow: fd={} flow_id={} src={} group={} "
+      "udp_port={} cipher_suite={:#x} first_pkt_num={}",
+      ep.fd, util::format_hex(std::span{mc_flow_.flow_id}),
+      src_str ? src_str : "?", group_str ? group_str : "?", udp_port,
+      cipher_suite, first_pkt_num);
+    std::println(stderr,
+                 "mc_flow: secret={} key={} iv={} hp_key={}",
+                 util::format_hex(std::span{mc_flow_.secret}),
+                 util::format_hex(std::span{mc_flow_.key}),
+                 util::format_hex(std::span{mc_flow_.iv}),
+                 util::format_hex(std::span{mc_flow_.hp_key}));
+  }
+
+  return 0;
+}
+
+void Client::on_mc_read(const Endpoint &ep) {
+  std::array<uint8_t, 64_k> buf;
+  sockaddr_storage ss;
+
+  for (;;) {
+    socklen_t sslen = sizeof(ss);
+    auto nread = recvfrom(ep.fd, buf.data(), buf.size(), 0,
+                         reinterpret_cast<sockaddr *>(&ss), &sslen);
+    if (nread == -1) {
+      if (errno != EAGAIN && errno != EWOULDBLOCK) {
+        std::println(stderr, "mc recvfrom: {}", strerror(errno));
+      }
+      break;
+    }
+
+    if (!config.quiet) {
+      std::println(stderr, "mc recvfrom: {} bytes", nread);
+    }
+
+    process_mc_packet({buf.data(), static_cast<size_t>(nread)});
+  }
+}
+
+void Client::process_mc_packet(std::span<const uint8_t> pkt) {
+  if (!mc_flow_.active) {
+    return;
+  }
+
+  ngtcp2_pkt_hd hd;
+  auto nread = ngtcp2_pkt_decode_hd_short(&hd, pkt.data(), pkt.size(),
+                                          mc_flow_.flow_id.size());
+  if (nread < 0) {
+    if (!config.quiet) {
+      std::println(stderr,
+                   "mc_flow: header decode failed for {} byte packet: {}",
+                   pkt.size(), ngtcp2_strerror(static_cast<int>(nread)));
+    }
+    return;
+  }
+
+  // The HP sample is always taken 4 bytes after the start of the
+  // (as yet unknown-length) packet number field, regardless of the
+  // packet number's actual encoded length -- this is fixed by RFC
+  // 9001 section 5.4.2, not by the packet number length itself.
+  constexpr size_t kMaxPktNumLen = 4;
+  constexpr size_t kSampleLen = 16;
+
+  auto pn_offset = static_cast<size_t>(nread);
+
+  if (pkt.size() < pn_offset + kMaxPktNumLen + kSampleLen) {
+    if (!config.quiet) {
+      std::println(stderr, "mc_flow: {} byte packet too short (need {})",
+                   pkt.size(), pn_offset + kMaxPktNumLen + kSampleLen);
+    }
+    return;
+  }
+
+  auto sample_offset = pn_offset + kMaxPktNumLen;
+
+  std::array<uint8_t, 5> mask{};
+  if (!aes128_ecb_mask(mask, mc_flow_.hp_key,
+                       pkt.subspan(sample_offset, kSampleLen))) {
+    if (!config.quiet) {
+      std::println(stderr, "mc_flow: header protection mask failed");
+    }
+    return;
+  }
+
+  // Unmask the first byte first to learn the real (variable) packet
+  // number length -- despite the draft stating Packet Number Length
+  // is always 0b11 (4 bytes), real servers may use standard QUIC
+  // variable-length packet number encoding.
+  auto first_byte = static_cast<uint8_t>(pkt[0] ^ (mask[0] & 0x1f));
+  auto pktnumlen = static_cast<size_t>((first_byte & 0x03) + 1);
+
+  std::vector<uint8_t> header(pkt.begin(), pkt.begin() + pn_offset + pktnumlen);
+  header[0] = first_byte;
+  for (size_t i = 0; i < pktnumlen; ++i) {
+    header[pn_offset + i] =
+      static_cast<uint8_t>(header[pn_offset + i] ^ mask[1 + i]);
+  }
+
+  uint64_t pkt_num = 0;
+  for (size_t i = 0; i < pktnumlen; ++i) {
+    pkt_num = (pkt_num << 8) | header[pn_offset + i];
+  }
+
+  auto nonce = mc_flow_.iv;
+  for (size_t i = 0; i < pktnumlen; ++i) {
+    nonce[nonce.size() - 1 - i] =
+      static_cast<uint8_t>(nonce[nonce.size() - 1 - i] ^ (pkt_num >> (8 * i)));
+  }
+
+  auto payload = pkt.subspan(pn_offset + pktnumlen);
+  if (payload.size() < 16) {
+    return;
+  }
+
+  std::vector<uint8_t> plaintext(payload.size() - 16);
+  if (!aes128gcm_decrypt(plaintext, payload, mc_flow_.key, nonce, header)) {
+    if (!config.quiet) {
+      std::println(stderr,
+                   "mc_flow: packet decrypt failed pkt_num={} pktnumlen={} "
+                   "header={} nonce={} payloadlen={} tag={}",
+                   pkt_num, pktnumlen, util::format_hex(header),
+                   util::format_hex(std::span{nonce}), payload.size(),
+                   util::format_hex(payload.last(16)));
+    }
+    return;
+  }
+
+  if (!config.quiet) {
+    std::println(stderr, "mc_flow: decrypt OK pkt_num={} plaintextlen={}",
+                pkt_num, plaintext.size());
+  }
+
+  extract_mc_datagrams(plaintext);
+}
+
+void Client::extract_mc_datagrams(std::span<const uint8_t> data) {
+  size_t i = 0;
+
+  while (i < data.size()) {
+    auto type = data[i];
+
+    switch (type) {
+    case 0x00: // PADDING
+    case 0x01: // PING
+      ++i;
+      continue;
+    case 0x30: { // DATAGRAM
+      auto dgram = data.subspan(i + 1);
+      std::println("mc datagram: {} bytes", dgram.size());
+      return;
+    }
+    case 0x31: { // DATAGRAM_LEN
+      ++i;
+      if (i >= data.size()) {
+        return;
+      }
+
+      auto first = data[i];
+      size_t lenbytes = size_t{1} << (first >> 6);
+      if (i + lenbytes > data.size()) {
+        return;
+      }
+
+      uint64_t len = first & 0x3f;
+      for (size_t k = 1; k < lenbytes; ++k) {
+        len = (len << 8) | data[i + k];
+      }
+      i += lenbytes;
+
+      if (i + len > data.size()) {
+        return;
+      }
+
+      std::println("mc datagram: {} bytes", len);
+      i += len;
+      continue;
+    }
+    default:
+      // Unexpected frame type in an MC_FLOW packet; stop parsing.
+      return;
+    }
+  }
+}
 
 std::expected<Endpoint *, Error>
 Client::endpoint_for(const Address &remote_addr) {
@@ -2167,6 +2731,10 @@ Options:
               to send  per an event  loop in a single  connection.  It
               defaults  to 0,  which means  it is  not limited  by the
               configuration.
+  --mc-quic   Send "mc-quic" ALPN token instead of the usual h3 or
+              hq-interop  token, for  the experimental  multicast QUIC
+              extension.  See
+              https://github.com/louisna/minimal-multicast-quic-ietf-126.
   -h, --help  Display this help and exit.
 
 ---
@@ -2254,6 +2822,7 @@ int main(int argc, char **argv) {
       {"no-gso", no_argument, &flag, 45},
       {"show-stat", no_argument, &flag, 46},
       {"gso-burst", required_argument, &flag, 47},
+      {"mc-quic", no_argument, &flag, 48},
       {},
     };
 
@@ -2764,6 +3333,10 @@ int main(int argc, char **argv) {
 
         break;
       }
+      case 48:
+        // --mc-quic
+        config.mc_quic = true;
+        break;
       }
       break;
     default:

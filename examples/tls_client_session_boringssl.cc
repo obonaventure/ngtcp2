@@ -53,13 +53,17 @@ TLSClientSession::init(bool &early_data_enabled,
   SSL_set_app_data(ssl_, client->conn_ref());
   SSL_set_connect_state(ssl_);
 
-  switch (app_proto) {
-  case AppProtocol::H3:
-    SSL_set_alpn_protos(ssl_, H3_ALPN.data(), H3_ALPN.size());
-    break;
-  case AppProtocol::HQ:
-    SSL_set_alpn_protos(ssl_, HQ_ALPN.data(), HQ_ALPN.size());
-    break;
+  if (config.mc_quic) {
+    SSL_set_alpn_protos(ssl_, MC_ALPN.data(), MC_ALPN.size());
+  } else {
+    switch (app_proto) {
+    case AppProtocol::H3:
+      SSL_set_alpn_protos(ssl_, H3_ALPN.data(), H3_ALPN.size());
+      break;
+    case AppProtocol::HQ:
+      SSL_set_alpn_protos(ssl_, HQ_ALPN.data(), HQ_ALPN.size());
+      break;
+    }
   }
 
   if (!config.sni.empty()) {

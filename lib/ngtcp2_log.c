@@ -384,6 +384,18 @@ static void log_fr_datagram(ngtcp2_log *log, const ngtcp2_pkt_hd *hd,
                        ") len=", ngtcp2_vec_len(fr->data, fr->datacnt));
 }
 
+static void log_fr_mc_flow(ngtcp2_log *log, const ngtcp2_pkt_hd *hd,
+                           const ngtcp2_mc_flow *fr, const char *dir) {
+  ngtcp2_log_infof_raw(log, NGTCP2_LOG_EVENT_FRM, NGTCP2_LOG_PKT(dir, hd),
+                       " MC_FLOW(0x", hex(fr->type),
+                       ") flow_idlen=", fr->flow_idlen,
+                       " ip_version=", fr->ip_version,
+                       " udp_port=", fr->udp_port,
+                       " cipher_suite=0x", hex(fr->cipher_suite),
+                       " first_pkt_num=", fr->first_pkt_num,
+                       " secretlen=", fr->secretlen);
+}
+
 static void log_fr(ngtcp2_log *log, const ngtcp2_pkt_hd *hd,
                    const ngtcp2_frame *fr, const char *dir) {
   switch (fr->hd.type) {
@@ -454,6 +466,9 @@ static void log_fr(ngtcp2_log *log, const ngtcp2_pkt_hd *hd,
   case NGTCP2_FRAME_DATAGRAM:
   case NGTCP2_FRAME_DATAGRAM_LEN:
     log_fr_datagram(log, hd, &fr->datagram, dir);
+    break;
+  case NGTCP2_FRAME_MC_FLOW:
+    log_fr_mc_flow(log, hd, &fr->mc_flow, dir);
     break;
   default:
     ngtcp2_unreachable();
@@ -622,6 +637,9 @@ void ngtcp2_log_remote_tp(ngtcp2_log *log,
   ngtcp2_log_infof_raw(
     log, NGTCP2_LOG_EVENT_CRY,
     NGTCP2_LOG_TP " grease_quic_bit=", params->grease_quic_bit);
+  ngtcp2_log_infof_raw(
+    log, NGTCP2_LOG_EVENT_CRY,
+    NGTCP2_LOG_TP " multicast_support=", params->multicast_support);
 
   if (params->version_info_present) {
     ngtcp2_log_infof_raw(log, NGTCP2_LOG_EVENT_CRY,

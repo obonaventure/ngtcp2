@@ -647,6 +647,27 @@ static uint8_t *write_datagram_frame(uint8_t *p, const ngtcp2_datagram *fr) {
   return p;
 }
 
+static uint8_t *write_mc_flow_frame(uint8_t *p, const ngtcp2_mc_flow *fr) {
+  /*
+   * {"frame_type":"mc_flow","flow_idlen":0000000000000000000,"udp_port":0000000000000000000,"cipher_suite":0000000000000000000,"first_pkt_num":0000000000000000000,"secretlen":0000000000000000000}
+   */
+#define NGTCP2_QLOG_MC_FLOW_FRAME_OVERHEAD 191
+
+  p = write_verbatim(p, "{\"frame_type\":\"mc_flow\",");
+  p = write_pair_number(p, "flow_idlen", fr->flow_idlen);
+  *p++ = ',';
+  p = write_pair_number(p, "udp_port", fr->udp_port);
+  *p++ = ',';
+  p = write_pair_number(p, "cipher_suite", fr->cipher_suite);
+  *p++ = ',';
+  p = write_pair_number(p, "first_pkt_num", fr->first_pkt_num);
+  *p++ = ',';
+  p = write_pair_number(p, "secretlen", fr->secretlen);
+  *p++ = '}';
+
+  return p;
+}
+
 static uint8_t *qlog_write_time(ngtcp2_qlog *qlog, uint8_t *p) {
   return write_pair_tstamp(p, "time", qlog->last_ts - qlog->ts);
 }
@@ -872,6 +893,12 @@ void ngtcp2_qlog_write_frame(ngtcp2_qlog *qlog, const ngtcp2_frame *fr) {
     }
     p = write_datagram_frame(p, &fr->datagram);
     break;
+  case NGTCP2_FRAME_MC_FLOW:
+    if (ngtcp2_buf_left(&qlog->buf) < NGTCP2_QLOG_MC_FLOW_FRAME_OVERHEAD + 1) {
+      return;
+    }
+    p = write_mc_flow_frame(p, &fr->mc_flow);
+    break;
   default:
     ngtcp2_unreachable();
   }
@@ -1013,6 +1040,8 @@ void ngtcp2_qlog_parameters_set_transport_params(
                         params->max_datagram_frame_size);
   *p++ = ',';
   p = write_pair_bool(p, "grease_quic_bit", params->grease_quic_bit);
+  *p++ = ',';
+  p = write_pair_bool(p, "multicast_support", params->multicast_support);
   p = write_verbatim(p, "}}\n");
 
   qlog->write(qlog->user_data, NGTCP2_QLOG_WRITE_FLAG_NONE, buf,

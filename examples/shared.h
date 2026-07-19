@@ -99,6 +99,12 @@ inline constexpr uint8_t RAW_H3_ALPN[] = "\x2h3";
 inline constexpr auto H3_ALPN = span_from_lit(RAW_H3_ALPN);
 inline constexpr auto H3_ALPN_V1 = span_from_lit(RAW_H3_ALPN);
 
+// MC_ALPN is the ALPN token for the experimental multicast QUIC
+// extension.  See
+// https://github.com/louisna/minimal-multicast-quic-ietf-126.
+inline constexpr uint8_t RAW_MC_ALPN[] = "\x7mc-quic";
+inline constexpr auto MC_ALPN = span_from_lit(RAW_MC_ALPN);
+
 inline constexpr uint32_t TLS_ALERT_ECH_REQUIRED = 121;
 
 inline constexpr auto MAX_RECV_PKTS = 64UZ;

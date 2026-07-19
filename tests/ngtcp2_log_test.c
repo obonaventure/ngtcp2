@@ -1122,6 +1122,8 @@ void test_ngtcp2_log_remote_tp(void) {
         "I00001123 0xdeadbeef cry remote transport_parameters "
         "grease_quic_bit=1",
         "I00001123 0xdeadbeef cry remote transport_parameters "
+        "multicast_support=0",
+        "I00001123 0xdeadbeef cry remote transport_parameters "
         "version_information.chosen_version=0x00000001",
         "I00001123 0xdeadbeef cry remote transport_parameters "
         "version_information.available_versions[0]=0xff000000",
@@ -1247,6 +1249,8 @@ void test_ngtcp2_log_remote_tp(void) {
         "max_datagram_frame_size=63",
         "I00001123 0xdeadbeef cry remote transport_parameters "
         "grease_quic_bit=1",
+        "I00001123 0xdeadbeef cry remote transport_parameters "
+        "multicast_support=0",
       },
   };
 

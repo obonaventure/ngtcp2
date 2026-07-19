@@ -179,6 +179,12 @@ typedef struct ngtcp2_pkt_retry {
 #define NGTCP2_FRAME_HANDSHAKE_DONE 0x1EU
 #define NGTCP2_FRAME_DATAGRAM 0x30U
 #define NGTCP2_FRAME_DATAGRAM_LEN 0x31U
+/* https://github.com/louisna/minimal-multicast-quic-ietf-126 */
+#define NGTCP2_FRAME_MC_FLOW 0xff4d43ULL
+
+/* NGTCP2_MC_FLOW_MAX_FLOW_IDLEN is the maximum length of Flow ID
+   field in MC_FLOW frame. */
+#define NGTCP2_MC_FLOW_MAX_FLOW_IDLEN 20
 
 typedef struct ngtcp2_frame_hd {
   uint64_t type;
@@ -345,6 +351,32 @@ typedef struct ngtcp2_datagram {
   ngtcp2_vec *data;
 } ngtcp2_datagram;
 
+/* ngtcp2_mc_flow represents the experimental MC_FLOW frame from
+   https://github.com/louisna/minimal-multicast-quic-ietf-126.  flow_id
+   and secret point into the buffer passed to the decode function, and
+   are valid only as long as that buffer is alive. */
+typedef struct ngtcp2_mc_flow {
+  uint64_t type;
+  /* flow_id points to Flow ID field. */
+  uint8_t *flow_id;
+  /* flow_idlen is the length of flow_id, in [1, NGTCP2_MC_FLOW_MAX_FLOW_IDLEN]. */
+  size_t flow_idlen;
+  /* ip_version is either 4 or 6. */
+  uint8_t ip_version;
+  /* src_ip contains Source IP in network byte order.  Only the first
+     4 bytes are significant if ip_version == 4. */
+  uint8_t src_ip[16];
+  /* group_ip contains Group IP in network byte order.  Only the
+     first 4 bytes are significant if ip_version == 4. */
+  uint8_t group_ip[16];
+  uint16_t udp_port;
+  uint16_t cipher_suite;
+  uint64_t first_pkt_num;
+  /* secret points to Secret field. */
+  uint8_t *secret;
+  size_t secretlen;
+} ngtcp2_mc_flow;
+
 typedef union ngtcp2_frame {
   ngtcp2_frame_hd hd;
   ngtcp2_stream stream;
@@ -366,6 +398,7 @@ typedef union ngtcp2_frame {
   ngtcp2_new_token new_token;
   ngtcp2_retire_connection_id retire_connection_id;
   ngtcp2_handshake_done handshake_done;
+  ngtcp2_mc_flow mc_flow;
   ngtcp2_datagram datagram;
 } ngtcp2_frame;
 
@@ -844,6 +877,24 @@ ngtcp2_ssize ngtcp2_pkt_decode_handshake_done_frame(ngtcp2_handshake_done *dest,
 ngtcp2_ssize ngtcp2_pkt_decode_datagram_frame(ngtcp2_datagram *dest,
                                               const uint8_t *payload,
                                               size_t payloadlen);
+
+/*
+ * ngtcp2_pkt_decode_mc_flow_frame decodes MC_FLOW frame from
+ * |payload| of length |payloadlen|.  The result is stored in the
+ * object pointed by |dest|.  MC_FLOW frame must start at payload[0].
+ * dest->flow_id and dest->secret point into |payload|, and are valid
+ * only as long as |payload| is alive.  This function finishes when
+ * it decodes one MC_FLOW frame, and returns the exact number of
+ * bytes read to decode a frame if it succeeds, or one of the
+ * following negative error codes:
+ *
+ * NGTCP2_ERR_FRAME_ENCODING
+ *     Payload is too short to include MC_FLOW frame; or a field
+ *     contains an invalid value.
+ */
+ngtcp2_ssize ngtcp2_pkt_decode_mc_flow_frame(ngtcp2_mc_flow *dest,
+                                             const uint8_t *payload,
+                                             size_t payloadlen);
 
 /*
  * ngtcp2_pkt_encode_stream_frame encodes STREAM frame |fr| into the

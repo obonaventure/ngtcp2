@@ -1626,6 +1626,12 @@ typedef struct ngtcp2_transport_params {
    */
   uint8_t grease_quic_bit;
   /**
+   * :member:`multicast_support` is nonzero if sender supports the
+   * experimental multicast extension for QUIC.  See
+   * https://github.com/louisna/minimal-multicast-quic-ietf-126.
+   */
+  uint8_t multicast_support;
+  /**
    * :member:`version_info` contains version_information field if
    * :member:`version_info_present` is nonzero.  Application should
    * not specify this field.
@@ -3445,6 +3451,33 @@ typedef int (*ngtcp2_recv_datagram)(ngtcp2_conn *conn, uint32_t flags,
 /**
  * @functypedef
  *
+ * :type:`ngtcp2_recv_mc_flow` is invoked when the experimental
+ * MC_FLOW frame (see
+ * https://github.com/louisna/minimal-multicast-quic-ietf-126) is
+ * received.  |flow_id| of length |flow_idlen| is the Flow ID.
+ * |ip_version| is either 4 or 6, and |src_ip|/|group_ip| contain the
+ * Source/Group IP in network byte order (4 bytes if |ip_version| is
+ * 4, or 16 bytes if it is 6).  |udp_port| and |cipher_suite| are the
+ * UDP Port and Cipher Suite fields.  |first_pkt_num| is the First
+ * Packet Number field.  |secret| of length |secretlen| is the shared
+ * Secret.
+ *
+ * The callback function must return 0 if it succeeds, or
+ * :macro:`NGTCP2_ERR_CALLBACK_FAILURE` which makes the library return
+ * immediately.
+ */
+typedef int (*ngtcp2_recv_mc_flow)(ngtcp2_conn *conn, const uint8_t *flow_id,
+                                   size_t flow_idlen, uint8_t ip_version,
+                                   const uint8_t *src_ip,
+                                   const uint8_t *group_ip, uint16_t udp_port,
+                                   uint16_t cipher_suite,
+                                   uint64_t first_pkt_num,
+                                   const uint8_t *secret, size_t secretlen,
+                                   void *user_data);
+
+/**
+ * @functypedef
+ *
  * :type:`ngtcp2_ack_datagram` is invoked when a packet which contains
  * DATAGRAM frame which is identified by |dgram_id| is acknowledged.
  * |dgram_id| is the valued passed to `ngtcp2_conn_writev_datagram`.
@@ -3987,6 +4020,12 @@ typedef struct ngtcp2_callbacks {
    * optional.
    */
   ngtcp2_recv_datagram recv_datagram;
+  /**
+   * :member:`recv_mc_flow` is a callback function which is invoked
+   * when the experimental MC_FLOW frame is received.  This callback
+   * function is optional.
+   */
+  ngtcp2_recv_mc_flow recv_mc_flow;
   /**
    * :member:`ack_datagram` is a callback function which is invoked
    * when a QUIC packet containing DATAGRAM frame is acknowledged by a

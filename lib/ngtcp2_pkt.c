@@ -487,13 +487,19 @@ ngtcp2_ssize ngtcp2_frame_decoder_decode(ngtcp2_frame_decoder *frd,
                                          ngtcp2_frame *dest,
                                          const uint8_t *payload,
                                          size_t payloadlen) {
-  uint8_t type;
+  uint64_t type;
+  size_t typelen;
 
   if (payloadlen == 0) {
     return NGTCP2_ERR_FRAME_ENCODING;
   }
 
-  type = payload[0];
+  typelen = ngtcp2_get_uvarintlen(payload);
+  if (payloadlen < typelen) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  ngtcp2_get_uvarint(&type, payload);
 
   switch (type) {
   case NGTCP2_FRAME_PADDING:
@@ -560,6 +566,8 @@ ngtcp2_ssize ngtcp2_frame_decoder_decode(ngtcp2_frame_decoder *frd,
     dest->datagram.data = &frd->buf.data;
     return ngtcp2_pkt_decode_datagram_frame(&dest->datagram, payload,
                                             payloadlen);
+  case NGTCP2_FRAME_MC_FLOW:
+    return ngtcp2_pkt_decode_mc_flow_frame(&dest->mc_flow, payload, payloadlen);
   default:
     if ((type & ~(NGTCP2_FRAME_STREAM - 1)) == NGTCP2_FRAME_STREAM) {
       dest->stream.data = &frd->buf.data;
@@ -1503,6 +1511,107 @@ ngtcp2_ssize ngtcp2_pkt_decode_datagram_frame(ngtcp2_datagram *dest,
   assert((size_t)(p - payload) == len);
 
   return (ngtcp2_ssize)len;
+}
+
+ngtcp2_ssize ngtcp2_pkt_decode_mc_flow_frame(ngtcp2_mc_flow *dest,
+                                             const uint8_t *payload,
+                                             size_t payloadlen) {
+  const uint8_t *p = payload;
+  const uint8_t *end = payload + payloadlen;
+  size_t n;
+  size_t addrlen;
+  size_t flow_idlen;
+  size_t secretlen;
+  uint64_t vi;
+
+  assert(payloadlen > 0);
+
+  n = ngtcp2_get_uvarintlen(p);
+  if ((size_t)(end - p) < n) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+  p += n;
+
+  if ((size_t)(end - p) < 1) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  flow_idlen = *p;
+  if (flow_idlen < 1 || flow_idlen > NGTCP2_MC_FLOW_MAX_FLOW_IDLEN) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+  ++p;
+
+  if ((size_t)(end - p) < flow_idlen) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  dest->flow_id = (uint8_t *)p;
+  dest->flow_idlen = flow_idlen;
+  p += flow_idlen;
+
+  if ((size_t)(end - p) < 1) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  dest->ip_version = *p;
+  if (dest->ip_version != 4 && dest->ip_version != 6) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+  ++p;
+
+  addrlen = dest->ip_version == 4 ? 4 : 16;
+
+  if ((size_t)(end - p) < addrlen * 2) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  memset(dest->src_ip, 0, sizeof(dest->src_ip));
+  memset(dest->group_ip, 0, sizeof(dest->group_ip));
+  memcpy(dest->src_ip, p, addrlen);
+  p += addrlen;
+  memcpy(dest->group_ip, p, addrlen);
+  p += addrlen;
+
+  if ((size_t)(end - p) < 4) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  p = ngtcp2_get_uint16be(&dest->udp_port, p);
+  p = ngtcp2_get_uint16be(&dest->cipher_suite, p);
+
+  if ((size_t)(end - p) < 1) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  n = ngtcp2_get_uvarintlen(p);
+  if ((size_t)(end - p) < n) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+  p = ngtcp2_get_uvarint(&dest->first_pkt_num, p);
+
+  if ((size_t)(end - p) < 1) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  n = ngtcp2_get_uvarintlen(p);
+  if ((size_t)(end - p) < n) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+  p = ngtcp2_get_uvarint(&vi, p);
+
+  secretlen = (size_t)vi;
+  if ((size_t)(end - p) < secretlen) {
+    return NGTCP2_ERR_FRAME_ENCODING;
+  }
+
+  dest->secret = (uint8_t *)p;
+  dest->secretlen = secretlen;
+  p += secretlen;
+
+  dest->type = NGTCP2_FRAME_MC_FLOW;
+
+  return (ngtcp2_ssize)(p - payload);
 }
 
 ngtcp2_ssize ngtcp2_pkt_encode_frame(uint8_t *out, size_t outlen,

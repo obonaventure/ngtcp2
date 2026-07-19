@@ -57,6 +57,8 @@ typedef uint64_t ngtcp2_transport_param_id;
 #define NGTCP2_TRANSPORT_PARAM_GREASE_QUIC_BIT 0x2AB2U
 /* https://datatracker.ietf.org/doc/html/rfc9368 */
 #define NGTCP2_TRANSPORT_PARAM_VERSION_INFORMATION 0x11U
+/* https://github.com/louisna/minimal-multicast-quic-ietf-126 */
+#define NGTCP2_TRANSPORT_PARAM_MULTICAST_SUPPORT 0xff4d40U
 
 /* NGTCP2_MAX_STREAMS is the maximum number of streams. */
 #define NGTCP2_MAX_STREAMS (1LL << 60)
